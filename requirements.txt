@@ -1,0 +1,12 @@
+pandas
+numpy
+scikit-learn
+scipy
+rapidfuzz
+sentence-transformers
+faiss-cpu
+xgboost
+tqdm
+pyyaml
+joblib
+openpyxl
