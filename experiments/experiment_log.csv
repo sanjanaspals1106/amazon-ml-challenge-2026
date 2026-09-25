@@ -1,0 +1,2 @@
+experiment_id,date,owner,blocking,K,normalization,features,model,threshold,validation_f05,precision,recall,US_f05,India_f05,S2_f05,S3_f05,notes
+baseline_dev_20260925_214300,2026-09-25,P1,"P2 CandidateGenerator (exact + IDF addr/name + name-p4, per-country)",50,P2 src/preprocessing/normalizer + P3 src/features/normalization,P3 build_features (56 numeric),hist_gradient_boosting (configured xgboost),0.65,0.8755,0.9716,0.8056,0.8808,0.8674,0.8544,0.8381,"dev sample=10000 S1 seed=42, val=2000 S1, full pool, one_owner margin=0.05;"

@@ -8,6 +8,8 @@ student_resource/dataset/
 dataset/
 *.csv
 *.tsv
+# ...but the team experiment log is tracked (team plan section 16)
+!experiments/experiment_log.csv
 *.xlsx
 *.xls
 *.zip

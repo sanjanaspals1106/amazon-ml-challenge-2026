@@ -162,3 +162,60 @@ Measured on the full test set (1,732,544 S1 entities; 9,969,589 S2 + S3 records;
 - Retrieval is memory-bandwidth-bound sparse matrix multiplication, so parallel speed-up is well below linear (≈ 2.4× with 6 workers here).
 - Keep the machine awake for the whole run (e.g. `caffeinate -i -w <PID>` on macOS).
 - **Recall:** on a small smoke test (2,000 train S1 entities against a 107k-record pool) recall of true matches was 98.9%, which is optimistic because the pool is tiny. Full-pool recall of this implementation has not been measured; an earlier prototype of the same retrieval idea measured ≈ 93.5% (US) / 87.0% (India) at K = 20 and ≈ 95.7% / 90.7% at K = 100 on training data.
+
+---
+
+## 7. Baseline Pipeline (integration, P1)
+
+`src/pipeline.py` wires the three components together; it contains no matching logic of its own.
+
+```
+load (src/data_loading.py) -> candidates (P2, via src/candidates.py) -> features (P3 build_features)
+  -> labels (P3 build_labels, retrieved non-matches as negatives) -> grouped split by S1 entity
+  -> matcher (P3 train_matcher / predict_match_scores) -> threshold search + one-owner rule + entity-level metrics
+  (src/postprocessing/) -> outputs + experiment log
+```
+
+**Development run** (train subset; everything configurable in `configs/baseline.yaml`):
+
+```bash
+python -m src.pipeline --config configs/baseline.yaml
+```
+
+Defaults: 10,000 random train S1 entities against the **full** train S2/S3 pool (so negatives are realistic look-alikes), K=50,
+4 blocking workers, 80/20 split grouped by S1 entity, threshold grid 0.30–0.90 (step 0.05) chosen by entity-level macro F0.5
+after the one-owner rule. The first run builds the candidate index over ~10M records (several minutes) and caches candidates and
+features under `outputs/cache/`; re-runs with unchanged inputs skip those stages.
+
+| Option | Meaning |
+| :--- | :--- |
+| `--sample-s1 N` | Override `dev.sample_s1` (number of S1 entities) |
+| `--workers N` | Override `candidates.workers` |
+| `--no-cache` | Ignore / do not write the candidate and feature caches |
+| `--no-log` / `--notes "..."` | Skip / annotate the experiment-log row |
+| `--allow-full` | Permit train mode on more than `dev.max_s1_without_flag` (200k) S1 entities (default guard) |
+| `--mode test`, `--allow-full-test` | Inference using the saved model and selected threshold; on all 1.73M test S1 entities it needs the explicit flag |
+
+`dev.pool_sample_frac < 1` shrinks the S2/S3 pool for **wiring-only** smoke runs; metrics from it are not representative
+(far fewer look-alike records than the real pool).
+
+**Outputs** (all git-ignored except the experiment log):
+
+| File | Content |
+| :--- | :--- |
+| `outputs/candidate_pairs.tsv` | Official format `source1_entity_id \t candidate_entity_ids` for every S1 in the sample |
+| `outputs/candidates_detailed.tsv` | Internal 7-column candidate schema (section 1) |
+| `outputs/matching_results.tsv` | Official format `source1_entity_id \t matched_entity_ids` for the validation S1 entities (train mode) |
+| `outputs/baseline_metrics.json` | Validation macro F0.5 / precision / recall, US / India / S2 / S3 F0.5, threshold, counts, threshold table, timings |
+| `models/baseline_matcher.joblib` | Trained P3 matcher (input to test mode) |
+| `experiments/experiment_log.csv` | One appended row per train run |
+
+**Validation semantics.** Metrics are entity-level macro averages over *all* validation S1 entities, including singletons and
+entities that received no candidates. Source (S2/S3) segments restrict both predictions and ground truth to that source; country
+segments select S1 entities by country. **Known dev-mode limitation:** competition features and the one-owner rule only see the
+sampled S1 entities' candidates, so contested source records are much rarer than in a full-scale run.
+
+**Model.** `model.model_type: xgboost` is P3's default; when `xgboost` is not installed P3's matcher falls back to scikit-learn
+`HistGradientBoostingClassifier` and the effective model is recorded in `baseline_metrics.json`.
+
+Tests: `python -m pytest tests -q`.

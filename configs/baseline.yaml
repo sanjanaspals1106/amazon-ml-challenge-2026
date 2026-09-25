@@ -1,0 +1,86 @@
+# Baseline pipeline configuration (P1 integration).  Run:
+#   python -m src.pipeline --config configs/baseline.yaml            # development run (train subset)
+# All paths are relative to the repository root (absolute paths also work). Nothing here is machine specific.
+
+experiment:
+  name: baseline_dev
+  owner: P1
+  log_run: true                 # append a row to paths.experiment_log after a train run
+  notes: ""
+
+paths:
+  dataset_root: student_resource/dataset
+  train:
+    source1: train/train_source1.tsv
+    source2: train/train_source2.tsv
+    source3: train/train_source3.tsv
+    ground_truth: train/train_ground_truth.tsv
+  test:
+    source1: test/test_source1.tsv
+    source2: test/test_source2.tsv
+    source3: test/test_source3.tsv
+  cache_dir: outputs/cache            # candidate + feature caches (git-ignored)
+  model_path: models/baseline_matcher.joblib   # git-ignored
+  experiment_log: experiments/experiment_log.csv
+
+# ---- development subset (train mode) --------------------------------------------------------------
+dev:
+  sample_s1: 10000              # number of train S1 entities to run end-to-end (null = ALL 2.2M; needs --allow-full)
+  sample_seed: 42
+  pool_sample_frac: 1.0         # 1.0 = full S2/S3 pool (realistic hard negatives). <1.0 = wiring-only smoke runs
+  max_s1_without_flag: 200000   # safety: larger samples require --allow-full
+
+test:
+  sample_s1: null               # null = ALL test S1 (1.73M) -> requires --allow-full-test
+  sample_seed: 42
+  pool_sample_frac: 1.0
+  max_s1_without_flag: 100000   # safety: test runs on more S1 entities require --allow-full-test
+  threshold: null               # null = read the selected threshold from outputs.metrics (written by a train run)
+
+# ---- blocking (P2 CandidateGenerator parameters) ----------------------------------------------------
+candidates:
+  top_k: 50
+  df_max: 20000
+  batch_size: 500
+  prefix_weight: 0.5
+  workers: 4                    # forked worker processes (1 = single process)
+  chunk_size: 0                 # S1 per chunk (0 = auto when workers > 1)
+  use_cache: true
+
+# ---- features / model (P3 modules; passed through unchanged) -----------------------------------------
+features: {}                    # config for src.features.build_features (P3 defaults)
+
+model:
+  model_type: xgboost           # P3 falls back to HistGradientBoostingClassifier when xgboost is not installed
+  auto_scale_pos_weight: false
+  model_params:
+    n_estimators: 250
+    max_depth: 6
+    learning_rate: 0.08
+    random_state: 42
+
+# ---- validation / thresholding / post-processing (P1) ----------------------------------------------
+validation:
+  val_fraction: 0.2             # fraction of S1 ENTITIES held out (grouped by S1, never by candidate row)
+  random_state: 42
+
+threshold_search:
+  grid: {start: 0.30, stop: 0.90, step: 0.05}
+  metric: macro_f05             # column of the threshold table to maximise (ties -> higher threshold)
+  apply_one_owner: true         # evaluate thresholds with the full decision rule (threshold + one-owner)
+
+one_owner:
+  enabled: true
+  near_tie_margin: 0.05         # drop a contested record if best - runner-up <= margin (null = never drop)
+
+# ---- outputs ---------------------------------------------------------------------------------------
+outputs:
+  candidate_pairs: outputs/candidate_pairs.tsv          # official format: source1_entity_id, candidate_entity_ids
+  candidates_detailed: outputs/candidates_detailed.tsv  # 7-column internal schema
+  matching_results: outputs/matching_results.tsv        # official format: source1_entity_id, matched_entity_ids
+  metrics: outputs/baseline_metrics.json
+
+outputs_test:                   # test mode writes here so it never overwrites the development outputs
+  candidate_pairs: outputs/test/candidate_pairs.tsv
+  candidates_detailed: outputs/test/candidates_detailed.tsv
+  matching_results: outputs/test/matching_results.tsv
