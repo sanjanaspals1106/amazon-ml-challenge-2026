@@ -1,0 +1,67 @@
+# =========================================
+# Competition dataset - NEVER commit
+# =========================================
+student_resource/dataset.zip
+student_resource/dataset/
+
+# Any other local dataset files
+dataset/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.zip
+
+# =========================================
+# Generated outputs
+# =========================================
+outputs/
+candidate_pairs/
+matching_results/
+
+# =========================================
+# Python
+# =========================================
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# =========================================
+# Models / large artifacts
+# =========================================
+models/
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.onnx
+
+# =========================================
+# Jupyter
+# =========================================
+.ipynb_checkpoints/
+
+# =========================================
+# Environment / secrets
+# =========================================
+.env
+.env.*
+!.env.example
+
+# =========================================
+# macOS
+# =========================================
+.DS_Store
+
+# =========================================
+# IDE
+# =========================================
+.vscode/
+.idea/
