@@ -1,0 +1,78 @@
+# Configuration for M2 Pair Features + Matching Model
+# Amazon ML Challenge 2026
+
+experiment:
+  name: "m2_baseline_xgboost"
+  version: "1.0"
+  description: "Baseline pair feature extraction and XGBoost matching model"
+
+features:
+  name_features:
+    token_sort: true
+    token_set: true
+    partial_ratio: true
+    jaro_winkler: true
+    normalized_levenshtein: true
+    token_jaccard: true
+    token_overlap: true
+    char_3gram_jaccard: true
+    first_token_equality: true
+    structural_diffs: true
+    legal_form_semantics: true
+    initials_matching: true
+    native_script_detection: true
+
+  address_features:
+    token_set: true
+    token_sort: true
+    normalized_levenshtein: true
+    token_jaccard: true
+    token_overlap: true
+    char_3gram_jaccard: true
+    structural_diffs: true
+    house_number_equality: true
+    house_number_norm_equality: true
+    house_number_off_by_one: true
+    postal_code_equality: true
+    us_state_agreement: true
+    empty_indicators: true
+
+  context_features:
+    country_indicators: true
+    source_indicators: true
+    retrieval_rank: true
+    retrieval_score: true
+    candidate_counts: true
+    competition_counts: true
+    is_best_score_for_s1: true
+
+model:
+  model_type: "xgboost"  # Options: "xgboost", "hist_gradient_boosting"
+  auto_scale_pos_weight: false
+  model_params:
+    n_estimators: 250
+    max_depth: 6
+    learning_rate: 0.08
+    subsample: 0.8
+    colsample_bytree: 0.8
+    eval_metric: "logloss"
+    random_state: 42
+    n_jobs: -1
+    tree_method: "hist"
+
+validation:
+  val_fraction: 0.2
+  random_state: 42
+  group_by: "s1_id"
+  thresholds:
+    - 0.30
+    - 0.40
+    - 0.50
+    - 0.55
+    - 0.60
+    - 0.65
+    - 0.70
+    - 0.75
+    - 0.80
+    - 0.85
+    - 0.90
