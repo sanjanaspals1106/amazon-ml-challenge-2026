@@ -1,0 +1,36 @@
+{
+  "baseline": {
+    "candidate_recall_pct": 99.78,
+    "us_recall_pct": 99.95017438963627,
+    "india_recall_pct": 99.52249308871576,
+    "s2_gt_recall_pct": 98.1737964927957,
+    "s3_gt_recall_pct": 97.84576298099824,
+    "avg_candidates_per_s1": 50.0,
+    "method_counts": {
+      "sparse_tfidf": 475268,
+      "exact_name": 18433,
+      "exact_addr": 4473,
+      "exact_both": 1826
+    },
+    "fit_time_s": 25.37077307701111,
+    "gen_time_s": 34.201520681381226,
+    "per_s1_ms": 3.4201520681381226
+  },
+  "modified": {
+    "candidate_recall_pct": 99.78,
+    "us_recall_pct": 99.95017438963627,
+    "india_recall_pct": 99.52249308871576,
+    "s2_gt_recall_pct": 98.1682117725902,
+    "s3_gt_recall_pct": 97.8404700153496,
+    "avg_candidates_per_s1": 50.0,
+    "method_counts": {
+      "sparse_tfidf": 476702,
+      "exact_name": 16999,
+      "exact_addr": 4473,
+      "exact_both": 1826
+    },
+    "fit_time_s": 25.462231874465942,
+    "gen_time_s": 46.309978723526,
+    "per_s1_ms": 4.630997872352601
+  }
+}

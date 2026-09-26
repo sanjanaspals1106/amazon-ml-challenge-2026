@@ -1,0 +1,64 @@
+Pass 1: streaming ground truth...
+  gt rows=2,206,821  with matches=2,083,574
+Pass 2: reservoir-sampling S1 entities with matches...
+  eligible S1 (has gt)=2,083,574  sampled=10,000
+country
+US       6021
+India    3979
+Name: count, dtype: int64
+  true-match entities to guarantee in corpus: 36,799
+Pass 3: streaming S2 + S3, building bounded corpus...
+  corpus built: 636,198 records (311,101 S2, 325,097 S3)
+country
+US       381489
+India    254709
+Name: count, dtype: int64
+  true-match ids missing from corpus (should be 0): 0
+
+=== BASELINE ===
+[CandidateGenerator] Preprocessing and indexing Source 2 and Source 3 corpora...
+[CandidateGenerator] Total candidate pool: 636,198 records (311,101 S2, 325,097 S3)
+[CandidateGenerator] Normalizing corpus names and addresses...
+[CandidateGenerator] Building per-country indices for 2 countries: ['India', 'US']
+[CandidateGenerator] Indexing country 'India' with 254,709 records...
+[CandidateGenerator] Indexing country 'US' with 381,489 records...
+[CandidateGenerator] Candidate index successfully built in 25.4s.
+[CandidateGenerator] Generating candidates for 10,000 Source 1 records...
+[CandidateGenerator] Processing 3,979 Source 1 records for country 'India'...
+[CandidateGenerator] Processing 6,021 Source 1 records for country 'US'...
+[CandidateGenerator] Generated 500,000 total candidate pairs for 10,000 S1 entities in 34.2s.
+fit_time=25.4s gen_time=34.2s per_s1=3.42ms
+
+=== MODIFIED ===
+[CandidateGenerator] Preprocessing and indexing Source 2 and Source 3 corpora...
+[CandidateGenerator] Total candidate pool: 636,198 records (311,101 S2, 325,097 S3)
+[CandidateGenerator] Normalizing corpus names and addresses...
+[CandidateGenerator] Building per-country indices for 2 countries: ['India', 'US']
+[CandidateGenerator] Indexing country 'India' with 254,709 records...
+[CandidateGenerator] Indexing country 'US' with 381,489 records...
+[CandidateGenerator] Candidate index successfully built in 25.5s.
+[CandidateGenerator] Generating candidates for 10,000 Source 1 records...
+[CandidateGenerator] Processing 3,979 Source 1 records for country 'India'...
+[CandidateGenerator] Processing 6,021 Source 1 records for country 'US'...
+[CandidateGenerator] Generated 500,000 total candidate pairs for 10,000 S1 entities in 46.3s.
+fit_time=25.5s gen_time=46.3s per_s1=4.63ms
+
+--- baseline metrics (K=50) ---
+Candidate recall (>=1 true match in top-50): 99.78%  (9978/10000)
+  US:    99.95%  (6018/6021)
+  India: 99.52%  (3960/3979)
+  S2 ground-truth match recall: 98.17% (17579/17906)
+  S3 ground-truth match recall: 97.85% (18486/18893)
+Avg candidates/S1: 50.00
+Retrieval method breakdown: {'sparse_tfidf': 475268, 'exact_name': 18433, 'exact_addr': 4473, 'exact_both': 1826}
+
+--- modified metrics (K=50) ---
+Candidate recall (>=1 true match in top-50): 99.78%  (9978/10000)
+  US:    99.95%  (6018/6021)
+  India: 99.52%  (3960/3979)
+  S2 ground-truth match recall: 98.17% (17578/17906)
+  S3 ground-truth match recall: 97.84% (18485/18893)
+Avg candidates/S1: 50.00
+Retrieval method breakdown: {'sparse_tfidf': 476702, 'exact_name': 16999, 'exact_addr': 4473, 'exact_both': 1826}
+
+Saved summary.json

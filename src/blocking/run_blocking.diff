@@ -1,0 +1,19 @@
+--- /mnt/user-data/uploads/run_blocking.py	2026-09-26 02:37:36.537001000 +0000
++++ /home/claude/blocking/run_blocking.py	2026-09-26 02:39:16.270321211 +0000
+@@ -52,6 +52,8 @@
+     parser.add_argument("--top-k", "-k", type=int, default=50, help="Maximum candidates per S1 entity")
+     parser.add_argument("--df-max", type=int, default=20000, help="Max document frequency for common token cutoff")
+     parser.add_argument("--batch-size", type=int, default=500, help="Query batch size for sparse retrieval")
++    parser.add_argument("--exact-name-cap", type=int, default=8,
++                        help="Max exact_name-tier candidates kept per S1 (reduces crowding out other tiers)")
+     args = parser.parse_args()
+ 
+     t_start = time.time()
+@@ -69,6 +71,7 @@
+         top_k=args.top_k,
+         df_max=args.df_max,
+         batch_size=args.batch_size,
++        exact_name_cap=args.exact_name_cap,
+         verbose=True,
+     )
+ 

@@ -1,0 +1,122 @@
+--- /mnt/user-data/uploads/candidate_generator.py	2026-09-26 02:37:36.475782000 +0000
++++ /home/claude/blocking/candidate_generator.py	2026-09-26 02:38:45.766432264 +0000
+@@ -47,6 +47,8 @@
+         batch_size: int = 500,
+         prefix_weight: float = 0.5,
+         verbose: bool = True,
++        exact_name_cap: int = 8,
++        exact_name_boost: float = 50.0,
+     ):
+         """
+         Args:
+@@ -55,12 +57,23 @@
+             batch_size: Number of S1 queries processed in a single sparse matrix multiplication batch.
+             prefix_weight: Weight discount for 4-character name prefixes vs full tokens.
+             verbose: If True, prints progress logs.
++            exact_name_cap: Maximum number of exact_name-tier candidates kept per S1 entity.
++                Exact-name matches are common (many businesses share a normalized name) but only
++                weakly predictive on their own, so they are ranked by their own sparse
++                name/address overlap score instead of a flat boost, and only the top
++                `exact_name_cap` are kept -- this frees up top-K slots for exact_addr /
++                sparse_tfidf candidates that were previously being crowded out.
++            exact_name_boost: Small additive boost applied on top of an exact_name candidate's
++                sparse score, so exact-name ties break above pure sparse_tfidf candidates with a
++                similar score, without letting them dominate the full 100.0 flat score used before.
+         """
+         self.top_k = top_k
+         self.df_max = df_max
+         self.batch_size = batch_size
+         self.prefix_weight = prefix_weight
+         self.verbose = verbose
++        self.exact_name_cap = exact_name_cap
++        self.exact_name_boost = exact_name_boost
+ 
+         # Country-indexed models & corpora
+         self.country_models: Dict[str, Dict] = {}
+@@ -225,19 +238,30 @@
+                 b_sa = batch["sorted_addr"].values
+ 
+                 # Sparse scoring
++                # NOTE: .multiply(idf) preserves the sparsity pattern of the input, so tokens
++                # with df > df_max (idf forced to 0.0, e.g. "private", "llc") are kept as
++                # *explicit* stored zeros. A CSR @ CSR matmul still walks the full posting list
++                # for every stored entry regardless of its value, so those zero-weight columns
++                # were silently costing the majority of the retrieval time. eliminate_zeros()
++                # drops those explicit zeros so the matmul skips them entirely. This is a pure
++                # sparsity-pruning step: any entry with weight 0 contributes 0 to the dot product
++                # either way, so scores and rankings are unchanged.
+                 # 1. Name query
+                 A_name = vec_name.transform(batch["norm_name"]).tocsr()
+                 A_name = A_name.multiply(idf_name).tocsr()
++                A_name.eliminate_zeros()
+                 P_name = A_name @ XT_name
+ 
+                 # 2. Prefix query
+                 A_p4 = vec_p4.transform(batch["name_p4"]).tocsr()
+                 A_p4 = A_p4.multiply(idf_p4).tocsr()
++                A_p4.eliminate_zeros()
+                 P_p4 = A_p4 @ XT_p4
+ 
+                 # 3. Address query
+                 A_addr = vec_addr.transform(batch["norm_addr"]).tocsr()
+                 A_addr = A_addr.multiply(idf_addr).tocsr()
++                A_addr.eliminate_zeros()
+                 P_addr = A_addr @ XT_addr
+ 
+                 # Summed sparse scores
+@@ -251,24 +275,43 @@
+ 
+                     candidate_dict: Dict[int, Tuple[float, str]] = {}
+ 
+-                    # 1. Exact Matches Tier
+-                    if sn and sn in name_exact_map:
+-                        for c_idx in name_exact_map[sn]:
+-                            # High exact score boost
+-                            candidate_dict[c_idx] = (100.0, "exact_name")
+-
++                    # 2. Sparse TF-IDF scores (computed before the exact tiers so exact_name
++                    #    candidates can be ranked/capped using their own overlap score instead
++                    #    of a flat boost).
++                    p_start = P_total.indptr[row_idx]
++                    p_end = P_total.indptr[row_idx + 1]
++                    indices = P_total.indices[p_start:p_end]
++                    scores = P_total.data[p_start:p_end]
++                    sparse_score_map: Dict[int, float] = (
++                        dict(zip(indices.tolist(), scores.tolist())) if len(indices) > 0 else {}
++                    )
++
++                    # 1a. Exact Matches Tier -- exact_addr / exact_both.
++                    # These are highly precise (~77-100% true-match rate) and are NOT capped:
++                    # they keep the original flat boost and always win their top-K slot.
+                     if sa and sa in addr_exact_map:
+                         for c_idx in addr_exact_map[sa]:
+-                            if c_idx in candidate_dict:
++                            if sn and sn in name_exact_map and c_idx in name_exact_map.get(sn, ()):
+                                 candidate_dict[c_idx] = (110.0, "exact_both")
+                             else:
+                                 candidate_dict[c_idx] = (95.0, "exact_addr")
+ 
+-                    # 2. Sparse TF-IDF Top-K retrieval
+-                    p_start = P_total.indptr[row_idx]
+-                    p_end = P_total.indptr[row_idx + 1]
+-                    indices = P_total.indices[p_start:p_end]
+-                    scores = P_total.data[p_start:p_end]
++                    # 1b. Exact Matches Tier -- exact_name only.
++                    # Exact-name matches alone are common but weakly predictive (~10.7% true
++                    # match rate measured on dev), so a flat 100.0 boost let them flood the
++                    # top-K and crowd out exact_addr / sparse_tfidf candidates. Instead: rank
++                    # exact-name matches by their own sparse retrieval score and keep only the
++                    # top `exact_name_cap` of them, each getting a small additive boost so ties
++                    # break in their favor without dominating the list.
++                    if sn and sn in name_exact_map:
++                        en_candidates = [
++                            (c_idx, sparse_score_map.get(c_idx, 0.0))
++                            for c_idx in name_exact_map[sn]
++                            if c_idx not in candidate_dict  # skip ones already exact_addr/both
++                        ]
++                        en_candidates.sort(key=lambda item: item[1], reverse=True)
++                        for c_idx, base_score in en_candidates[: self.exact_name_cap]:
++                            candidate_dict[c_idx] = (base_score + self.exact_name_boost, "exact_name")
+ 
+                     if len(indices) > 0:
+                         # Top candidates selection
