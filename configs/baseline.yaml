@@ -41,9 +41,9 @@ test:
 candidates:
   top_k: 50
   df_max: 20000
-  batch_size: 500
+  batch_size: 100
   prefix_weight: 0.5
-  workers: 4                    # forked worker processes (1 = single process)
+  workers: 6                    # forked worker processes (1 = single process)
   chunk_size: 0                 # S1 per chunk (0 = auto when workers > 1)
   use_cache: true
 

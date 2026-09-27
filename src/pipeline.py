@@ -23,18 +23,20 @@ import inspect
 import json
 import logging
 import math
+import multiprocessing as mp
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
 import yaml
 
 import src.features.normalization as _p3_norm
 import src.features.pair_features as _p3_pair_features
-from src.candidates import load_or_generate_candidates
+from src.blocking import CandidateGenerator
+from src.candidates import load_or_generate_candidates, prune_candidate_generator
 from src.data_loading import (
     DataError, dataset_paths, load_split, resolve_path, restrict_pool, sample_s1, validate_candidates,
 )
@@ -45,7 +47,7 @@ from src.model import (
 )
 from src.postprocessing import (
     apply_decision_rule, candidate_recall, evaluate_with_segments, grouped_split, make_threshold_grid,
-    search_threshold, truth_pairs, verify_one_owner,
+    resolve_one_owner, search_threshold, truth_pairs, verify_one_owner,
 )
 from src.postprocessing.output import (
     CANDIDATE_PAIRS_HEADER, MATCHING_HEADER, verify_output_file, write_candidate_pairs,
@@ -56,6 +58,110 @@ logger = logging.getLogger("pipeline")
 
 
 # ----------------------------------------------------------------------------------------------- helpers
+def get_free_memory_ratio() -> float:
+    """Return fraction of available memory (0.0 to 1.0)."""
+    try:
+        import psutil
+        v = psutil.virtual_memory()
+        return float(v.available) / float(v.total)
+    except Exception:
+        return 1.0
+
+
+def parse_deadline(deadline_str: Optional[str]) -> Optional[datetime]:
+    """Parse local time deadline string HH:MM into a datetime object."""
+    if not deadline_str:
+        return None
+    try:
+        parts = [int(p) for p in deadline_str.strip().split(":")]
+        now = datetime.now()
+        d = now.replace(hour=parts[0], minute=parts[1], second=0, microsecond=0)
+        if d < now and (now - d).total_seconds() > 43200:
+            d += timedelta(days=1)
+        return d
+    except Exception as e:
+        logger.error("Failed to parse deadline %r: %s", deadline_str, e)
+        return None
+
+
+_TEST_SHARED: Dict[str, object] = {}
+
+
+def _test_chunk_worker(args_tuple: Tuple[int, int, int, str, bool]) -> dict:
+    """Process a single S1 chunk for inference in a forked worker."""
+    chunk_idx, start, end, chunk_dir_str, resume = args_tuple
+    chunk_dir = Path(chunk_dir_str)
+    cand_path = chunk_dir / f"chunk_{chunk_idx:05d}_cand.parquet"
+    matches_path = chunk_dir / f"chunk_{chunk_idx:05d}_matches.parquet"
+
+    if resume and cand_path.exists() and matches_path.exists():
+        try:
+            cand_df = pd.read_parquet(cand_path)
+            m_df = pd.read_parquet(matches_path)
+            return {
+                "chunk_idx": chunk_idx,
+                "start": start,
+                "end": end,
+                "n_s1": end - start,
+                "n_candidates": len(cand_df),
+                "n_matches": len(m_df),
+                "resumed": True,
+            }
+        except Exception:
+            pass  # Recompute if reading failed
+
+    s1_chunk = _TEST_SHARED["s1"].iloc[start:end]
+    s1_chunk_ids = s1_chunk["entity_id"].tolist()
+    gen = _TEST_SHARED["gen"]
+
+    # 1. Candidate generation & validation
+    cand = gen.generate_candidates(source1_df=s1_chunk)
+    validate_candidates(cand, expected_s1_ids=s1_chunk_ids)
+
+    # 2. Extract ordered candidate IDs per S1
+    cand_map = {}
+    if not cand.empty:
+        for s1_id, grp in cand.groupby("s1_id", sort=False):
+            cand_map[s1_id] = list(dict.fromkeys(grp["source_record_id"].tolist()))
+
+    cand_rows = []
+    for s1_id in s1_chunk_ids:
+        cands_str = ",".join(cand_map.get(s1_id, []))
+        cand_rows.append((s1_id, cands_str))
+    chunk_cand_df = pd.DataFrame(cand_rows, columns=["source1_entity_id", "candidate_entity_ids"])
+
+    # 3. Features & predictions (only score >= threshold kept)
+    thr = float(_TEST_SHARED["threshold"])
+    if not cand.empty:
+        need = set(cand["source_record_id"].unique())
+        s2 = _TEST_SHARED["s2"]
+        s3 = _TEST_SHARED["s3"]
+        src_frames = {
+            "S2": s2[s2["entity_id"].isin(need)],
+            "S3": s3[s3["entity_id"].isin(need)],
+        }
+        feat = build_features(cand, s1_chunk, src_frames, config=_TEST_SHARED["features_cfg"])
+        feat["country"] = cand["country"].values
+        scores = predict_match_scores(_TEST_SHARED["model"], feat)
+        kept_mask = scores >= thr
+        kept_df = feat.loc[kept_mask, ["s1_id", "source_record_id", "source", "country"]].copy()
+        kept_df["score"] = scores[kept_mask]
+    else:
+        kept_df = pd.DataFrame(columns=["s1_id", "source_record_id", "source", "country", "score"])
+
+    # Save parquets
+    chunk_cand_df.to_parquet(cand_path, index=False)
+    kept_df.to_parquet(matches_path, index=False)
+
+    return {
+        "chunk_idx": chunk_idx,
+        "start": start,
+        "end": end,
+        "n_s1": len(s1_chunk_ids),
+        "n_candidates": len(cand),
+        "n_matches": len(kept_df),
+        "resumed": False,
+    }
 def load_config(path: str) -> dict:
     p = resolve_path(path)
     if not p.exists():
@@ -297,61 +403,244 @@ def run_train(cfg: dict, args) -> dict:
 
 # ----------------------------------------------------------------------------------------------- test
 def run_test(cfg: dict, args) -> dict:
-    """Inference on the test split. Guarded: without an explicit sample it needs --allow-full-test."""
+    """
+    Streaming, chunked, resumable inference on the test split.
+    Guarded: without an explicit sample it needs --allow-full-test.
+    """
     t_all = time.time()
     tcfg = cfg.get("test", {})
     n_s1 = args.sample_s1 if args.sample_s1 is not None else tcfg.get("sample_s1")
     seed = int(tcfg.get("sample_seed", 42))
-    use_cache = bool(cfg["candidates"].get("use_cache", True)) and not args.no_cache
-    if args.workers is not None:
-        cfg["candidates"]["workers"] = args.workers
+    workers = int(args.workers or cfg.get("candidates", {}).get("workers", 6))
+    chunk_size = int(getattr(args, "chunk_size", None) or tcfg.get("chunk_size", 10000))
+    chunk_size = min(chunk_size, 10000)  # Keep <= 10,000 per competition requirements
+    resume = bool(getattr(args, "resume", False))
+    deadline = parse_deadline(getattr(args, "deadline", None))
 
     model_path = resolve_path(cfg["paths"]["model_path"])
     if not model_path.exists():
         raise FileNotFoundError(f"Trained model not found: {model_path}. Run --mode train first.")
     thr = args.threshold if args.threshold is not None else tcfg.get("threshold")
     if thr is None:
-        mp = resolve_path(cfg["outputs"]["metrics"])
-        if not mp.exists():
-            raise FileNotFoundError(f"No threshold given and {mp} not found. Run --mode train first or pass --threshold.")
-        thr = json.loads(mp.read_text())["threshold"]
+        mp_path = resolve_path(cfg["outputs"]["metrics"])
+        if not mp_path.exists():
+            raise FileNotFoundError(f"No threshold given and {mp_path} not found. Run --mode train first or pass --threshold.")
+        thr = json.loads(mp_path.read_text())["threshold"]
     thr = float(thr)
+    logger.info("Test mode threshold: %.2f", thr)
 
     data = load_split(cfg, "test")
     s1_all, s2, s3 = data["s1"], data["s2"], data["s3"]
     _check_sample_guard(n_s1, len(s1_all), int(tcfg.get("max_s1_without_flag", 100000)), args.allow_full_test, "TEST mode")
-    s1 = sample_s1(s1_all, n_s1, seed)
+    s1 = sample_s1(s1_all, n_s1, seed).reset_index(drop=True)
     s1_ids = s1["entity_id"].tolist()
+
     pool_frac = float(tcfg.get("pool_sample_frac", 1.0))
-    s2p, s3p = restrict_pool(s2, s3, pool_frac, seed)
-    pool_desc = {"frac": pool_frac, "seed": seed, "n_s2": len(s2p), "n_s3": len(s3p)}
-    paths = dataset_paths(cfg, "test")
-    cand, cinfo = load_or_generate_candidates(
-        s1, {"S2": s2p, "S3": s3p}, cfg, "test", [paths["source1"], paths["source2"], paths["source3"]], pool_desc, use_cache)
-    vinfo = validate_candidates(cand, expected_s1_ids=s1_ids)
-    feat = _features_with_cache(cand, s1, s2p, s3p, cfg, cinfo["cache_key"], use_cache)
+    if pool_frac < 1.0:
+        s2p, s3p = restrict_pool(s2, s3, pool_frac, seed)
+    else:
+        s2p, s3p = s2, s3
 
     model = EntityResolutionMatcher.load(str(model_path))
-    missing = [c for c in model.feature_names_ if c not in feat.columns]
-    if missing:
-        raise DataError(f"Feature/model interface mismatch: features lack columns the model was trained on: {missing[:5]}")
-    scored = feat[["s1_id", "source_record_id", "source", "country"]].copy()
-    scored["score"] = predict_match_scores(model, feat)
+
+    # Fit CandidateGenerator once on the test pool
+    c = cfg.get("candidates", {})
+    gen = CandidateGenerator(
+        top_k=int(c.get("top_k", 50)),
+        df_max=int(c.get("df_max", 20000)),
+        batch_size=int(c.get("batch_size", 500)),
+        prefix_weight=float(c.get("prefix_weight", 0.5)),
+        verbose=True,
+    )
+    logger.info("Fitting candidate generator on test pool (%s S2, %s S3)...", f"{len(s2p):,}", f"{len(s3p):,}")
+    gen.fit(source2_df=s2p, source3_df=s3p)
+    prune_candidate_generator(gen)
+    gen.verbose = False
+
+    chunks_dir = resolve_path(cfg["paths"].get("cache_dir", "outputs/cache")) / "test_chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+
+    bounds = [(i, min(i + chunk_size, len(s1))) for i in range(0, len(s1), chunk_size)]
+    n_chunks = len(bounds)
+    logger.info("Processing %s test S1 in %d chunks (chunk_size=%d, workers=%d, deadline=%s, resume=%s)",
+                f"{len(s1):,}", n_chunks, chunk_size, workers, getattr(args, "deadline", None), resume)
+
+    _TEST_SHARED["gen"] = gen
+    _TEST_SHARED["s1"] = s1
+    _TEST_SHARED["s2"] = s2p
+    _TEST_SHARED["s3"] = s3p
+    _TEST_SHARED["model"] = model
+    _TEST_SHARED["features_cfg"] = cfg.get("features", {})
+    _TEST_SHARED["threshold"] = thr
+
+    chunk_results = {}
+    completed_chunks = set()
+    t_dispatch_start = time.time()
+
+    halted = False
+    try:
+        # maxtasksperchild=1: each chunk runs in a freshly forked worker that exits afterwards, so the memory a worker
+        # accumulates (sparse matmul temporaries, feature frames) is returned to the OS instead of piling up across chunks.
+        with mp.get_context("fork").Pool(processes=workers, maxtasksperchild=1) as pool:
+            in_flight = {}  # AsyncResult -> chunk_idx
+
+            for chunk_idx in range(n_chunks):
+                # Check deadline
+                if deadline is not None and datetime.now() >= deadline:
+                    logger.warning("Deadline (%s) reached! Halting dispatch of new chunks.", deadline.strftime("%H:%M"))
+                    halted = True
+                    break
+
+                # Memory guard: pause dispatch (in-flight chunks keep running and release memory) instead of quitting
+                mem_ratio = get_free_memory_ratio()
+                waited = 0
+                while mem_ratio < 0.07 and waited < 900:
+                    logger.warning("Memory guard: free memory %.1f%% < 7%%; pausing dispatch (%ds waited).", mem_ratio * 100, waited)
+                    time.sleep(15)
+                    waited += 15
+                    mem_ratio = get_free_memory_ratio()
+                if mem_ratio < 0.07:
+                    logger.warning("Memory guard: still %.1f%% free after %ds. Halting chunk dispatch; re-run with --resume and fewer workers.",
+                                   mem_ratio * 100, waited)
+                    halted = True
+                    break
+
+                # Throttle in-flight queue
+                while len(in_flight) >= workers * 2:
+                    done_tasks = []
+                    for async_res, c_idx in list(in_flight.items()):
+                        if async_res.ready():
+                            res = async_res.get()
+                            chunk_results[c_idx] = res
+                            completed_chunks.add(c_idx)
+                            done_tasks.append(async_res)
+                            p_s1 = sum(chunk_results[k]["n_s1"] for k in completed_chunks)
+                            el = time.time() - t_dispatch_start
+                            rate = p_s1 / el if el > 0 else 0.0
+                            eta_s = (len(s1) - p_s1) / rate if rate > 0 else 0
+                            logger.info("Chunk %d/%d done (+%d S1, %d/%d total, %.1f%%) | %.1f S1/s | ETA: %s [resumed=%s]",
+                                        c_idx + 1, n_chunks, res["n_s1"], p_s1, len(s1),
+                                        p_s1 / len(s1) * 100, rate, str(timedelta(seconds=int(eta_s))), res["resumed"])
+                    for t in done_tasks:
+                        del in_flight[t]
+                    if len(in_flight) >= workers * 2:
+                        time.sleep(0.2)
+
+                task_args = (chunk_idx, bounds[chunk_idx][0], bounds[chunk_idx][1], str(chunks_dir), resume)
+                async_res = pool.apply_async(_test_chunk_worker, (task_args,))
+                in_flight[async_res] = chunk_idx
+
+            # Close pool and wait for remaining in-flight tasks
+            pool.close()
+            t_wait = time.time()
+            while in_flight:
+                done_tasks = []
+                for async_res, c_idx in list(in_flight.items()):
+                    if async_res.ready():
+                        res = async_res.get()
+                        chunk_results[c_idx] = res
+                        completed_chunks.add(c_idx)
+                        done_tasks.append(async_res)
+                        p_s1 = sum(chunk_results[k]["n_s1"] for k in completed_chunks)
+                        el = time.time() - t_dispatch_start
+                        rate = p_s1 / el if el > 0 else 0.0
+                        logger.info("Chunk %d/%d done (+%d S1, %d/%d total, %.1f%%) | %.1f S1/s [resumed=%s]",
+                                    c_idx + 1, n_chunks, res["n_s1"], p_s1, len(s1),
+                                    p_s1 / len(s1) * 100, rate, res["resumed"])
+                for t in done_tasks:
+                    del in_flight[t]
+                if in_flight:
+                    if halted and time.time() - t_wait > 900.0:
+                        logger.warning("Dispatch was halted and in-flight chunks exceeded 900s. Terminating remaining worker tasks.")
+                        pool.terminate()
+                        break
+                    time.sleep(0.5)
+            pool.join()
+    finally:
+        _TEST_SHARED.clear()
+
+    # Stream candidate_pairs.tsv in S1 file order
+    outs = {k: resolve_path(v) for k, v in cfg["outputs_test"].items()}
+    logger.info("Writing candidate_pairs to %s...", outs["candidate_pairs"])
+    outs["candidate_pairs"].parent.mkdir(parents=True, exist_ok=True)
+    with open(outs["candidate_pairs"], "w", encoding="utf-8") as f:
+        f.write(CANDIDATE_PAIRS_HEADER + "\n")
+        for k in range(n_chunks):
+            cand_path = chunks_dir / f"chunk_{k:05d}_cand.parquet"
+            if k in completed_chunks and cand_path.exists():
+                cdf = pd.read_parquet(cand_path)
+                lines = [f"{s1_val}\t{c}\n" for s1_val, c in zip(cdf["source1_entity_id"], cdf["candidate_entity_ids"])]
+                f.writelines(lines)
+            else:
+                st, en = bounds[k]
+                lines = [f"{s1_val}\t\n" for s1_val in s1_ids[st:en]]
+                f.writelines(lines)
+
+    # Collect kept matches and resolve one-owner
+    logger.info("Collecting matches across %d completed chunks...", len(completed_chunks))
+    match_dfs = []
+    for k in completed_chunks:
+        matches_path = chunks_dir / f"chunk_{k:05d}_matches.parquet"
+        if matches_path.exists():
+            mdf = pd.read_parquet(matches_path)
+            if not mdf.empty:
+                match_dfs.append(mdf)
+
+    if match_dfs:
+        all_scored = pd.concat(match_dfs, ignore_index=True)
+    else:
+        all_scored = pd.DataFrame(columns=["s1_id", "source_record_id", "source", "country", "score"])
+
+    logger.info("Applying global one-owner rule to %s kept pairs...", f"{len(all_scored):,}")
     oo_cfg = cfg.get("one_owner", {})
-    acc, oo_info = apply_decision_rule(scored, thr, oo_cfg if oo_cfg.get("enabled", True) else None)
+    margin = float(oo_cfg.get("near_tie_margin", 0.05)) if oo_cfg.get("enabled", True) else None
+    acc, oo_info = resolve_one_owner(
+        all_scored,
+        threshold=thr,
+        near_tie_margin=margin,
+        score_col="score",
+        s1_col="s1_id",
+        record_col="source_record_id",
+    )
     if oo_cfg.get("enabled", True):
         verify_one_owner(acc)
 
-    outs = {k: resolve_path(v) for k, v in cfg["outputs_test"].items()}
-    write_candidate_pairs(cand, s1_ids, outs["candidate_pairs"])
-    write_candidates_detailed(cand, outs["candidates_detailed"])
+    logger.info("Writing matching_results to %s (%d accepted matches)...", outs["matching_results"], len(acc))
     write_matching_results(acc, s1_ids, outs["matching_results"])
+
+    logger.info("Verifying outputs...")
     verify_output_file(outs["candidate_pairs"], s1_ids, CANDIDATE_PAIRS_HEADER)
     verify_output_file(outs["matching_results"], s1_ids, MATCHING_HEADER, check_one_owner=True)
-    summary = {"mode": "test", "threshold": thr, "n_s1": len(s1), "n_candidate_pairs": int(len(cand)),
-               "n_predicted_matches": int(len(acc)), "one_owner": oo_info, "seconds": round(time.time() - t_all, 1),
-               "outputs": {k: str(v) for k, v in outs.items()}}
-    logger.info("Test-mode summary: %s", json.dumps(_clean(summary)))
+
+    processed_s1 = sum(chunk_results[k]["n_s1"] for k in completed_chunks)
+    coverage_pct = (processed_s1 / len(s1_ids)) * 100.0 if s1_ids else 0.0
+    total_time = round(time.time() - t_all, 1)
+
+    logger.info("=====================================================================")
+    logger.info("TEST MODE RUN COMPLETE")
+    logger.info("  Coverage: %d/%d S1 entities (%.2f%%)", processed_s1, len(s1_ids), coverage_pct)
+    logger.info("  Predicted matches: %d", len(acc))
+    logger.info("  Total runtime: %.1f seconds", total_time)
+    logger.info("  Candidate pairs file: %s", outs["candidate_pairs"])
+    logger.info("  Matching results file: %s", outs["matching_results"])
+    logger.info("=====================================================================")
+
+    if processed_s1 < len(s1_ids):
+        logger.error("INCOMPLETE RUN: only %d/%d S1 entities were processed (%.2f%%). Missing chunks were written as EMPTY rows, "
+                     "so these output files must NOT be submitted. Re-run with --resume (and fewer --workers if memory was the cause).",
+                     processed_s1, len(s1_ids), coverage_pct)
+
+    summary = {
+        "mode": "test",
+        "threshold": thr,
+        "total_s1": len(s1_ids),
+        "processed_s1": processed_s1,
+        "coverage_pct": coverage_pct,
+        "n_predicted_matches": int(len(acc)),
+        "one_owner": oo_info,
+        "seconds": total_time,
+        "outputs": {k: str(v) for k, v in outs.items() if k != "candidates_detailed"},
+    }
     return summary
 
 
@@ -362,6 +651,9 @@ def main(argv=None):
     ap.add_argument("--mode", choices=["train", "test"], default="train")
     ap.add_argument("--sample-s1", type=int, default=None, help="Override dev/test sample size (number of S1 entities)")
     ap.add_argument("--workers", type=int, default=None, help="Override candidates.workers")
+    ap.add_argument("--chunk-size", type=int, default=None, help="S1 chunk size for test mode (default 10000)")
+    ap.add_argument("--deadline", default=None, help="Local time deadline HH:MM to stop dispatching new chunks")
+    ap.add_argument("--resume", action="store_true", help="Resume test mode from existing cached chunks")
     ap.add_argument("--no-cache", action="store_true", help="Ignore and do not write candidate/feature caches")
     ap.add_argument("--no-log", action="store_true", help="Do not append a row to the experiment log")
     ap.add_argument("--notes", default="", help="Free-text note stored in the experiment log")
@@ -379,8 +671,11 @@ def main(argv=None):
         print(f"   macro F0.5={result['validation_f05']:.4f}  precision={result['precision']:.4f}  recall={result['recall']:.4f}")
         print(f"   US={result['US_f05']}  India={result['India_f05']}  S2={result['S2_f05']:.4f}  S3={result['S3_f05']:.4f}")
         print("=" * 70)
+    if args.mode == "test" and result.get("coverage_pct", 100.0) < 100.0:
+        sys.exit(2)   # incomplete test run: never let a partial output look like success
     return result
 
 
 if __name__ == "__main__":
     main()
+

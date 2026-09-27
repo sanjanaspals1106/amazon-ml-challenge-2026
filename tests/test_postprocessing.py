@@ -124,3 +124,49 @@ def test_experiment_log_append(tmp_path):
     assert list(df.columns) == COLUMNS and list(df["experiment_id"]) == ["x1", "x2"]
     with pytest.raises(KeyError):
         append_experiment({"bogus": 1}, p)
+
+
+# ---------------------------------------------------------------- deadline / memory / pruning
+def test_parse_deadline():
+    from src.pipeline import parse_deadline
+    assert parse_deadline(None) is None
+    assert parse_deadline("") is None
+    d = parse_deadline("23:30")
+    assert d is not None
+    assert d.hour == 23 and d.minute == 30 and d.second == 0
+
+
+def test_get_free_memory_ratio():
+    from src.pipeline import get_free_memory_ratio
+    ratio = get_free_memory_ratio()
+    assert 0.0 <= ratio <= 1.0
+
+
+def test_prune_candidate_generator():
+    import scipy.sparse as sp
+    from unittest.mock import MagicMock
+    from src.candidates import prune_candidate_generator
+
+    gen = MagicMock()
+    gen.df_max = 2
+
+    # Row 0: df=1 (<=2, keep); Row 1: df=3 (>2, prune); Row 2: df=2 (<=2, keep)
+    indptr = np.array([0, 1, 4, 6])
+    indices = np.array([0, 0, 1, 2, 0, 1])
+    data = np.ones(6, dtype=np.float32)
+    XT = sp.csr_matrix((data, indices, indptr), shape=(3, 5), dtype=np.float32)
+
+    gen.country_models = {
+        "US": {"XT_name": XT.copy(), "XT_p4": XT.copy(), "XT_addr": XT.copy()}
+    }
+
+    prune_candidate_generator(gen)
+
+    for k in ("XT_name", "XT_p4", "XT_addr"):
+        m = gen.country_models["US"][k]
+        # Row 1 should be eliminated
+        assert m.indptr[2] - m.indptr[1] == 0
+        # Rows 0 and 2 should be preserved
+        assert m.indptr[1] - m.indptr[0] == 1
+        assert m.indptr[3] - m.indptr[2] == 2
+

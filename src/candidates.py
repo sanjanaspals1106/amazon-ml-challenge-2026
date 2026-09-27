@@ -25,12 +25,36 @@ from typing import Dict, Tuple
 
 import pandas as pd
 
+import numpy as np
+import scipy.sparse as sp
+
 from src.blocking import CandidateGenerator
 from src.data_loading import CANDIDATE_COLUMNS, DataError, resolve_path
 
 logger = logging.getLogger(__name__)
 
 _SHARED: Dict[str, object] = {}  # generator / S1 frame shared with forked workers
+
+
+def prune_candidate_generator(gen: CandidateGenerator) -> CandidateGenerator:
+    """
+    Zero out posting lists of tokens whose document frequency exceeds df_max.
+    P2's generator already set their idf to 0.0, but left explicit zeros in A.multiply(idf),
+    causing sparse @ to scan massive posting lists. Zeroing the corresponding rows in XT
+    and calling eliminate_zeros() allows scipy.sparse to skip them entirely.
+    """
+    for country, model in gen.country_models.items():
+        for key in ("XT_name", "XT_p4", "XT_addr"):
+            if key not in model:
+                continue
+            XT = model[key]
+            df = np.diff(XT.indptr)
+            keep_mask = (df <= gen.df_max).astype(np.float32)
+            D = sp.diags(keep_mask, format="csr", dtype=np.float32)
+            XT_pruned = (D @ XT).tocsr()
+            XT_pruned.eliminate_zeros()
+            model[key] = XT_pruned
+    return gen
 
 
 def _chunk_worker(bounds: Tuple[int, int]) -> pd.DataFrame:
@@ -51,6 +75,7 @@ def generate_candidates(s1_df: pd.DataFrame, source_df: Dict[str, pd.DataFrame],
         verbose=True,
     )
     gen.fit(source2_df=source_df["S2"], source3_df=source_df["S3"])
+    prune_candidate_generator(gen)
 
     workers = int(c.get("workers", 1))
     chunk = int(c.get("chunk_size", 0))
@@ -91,6 +116,7 @@ def candidate_cache_key(s1_df: pd.DataFrame, config: dict, split: str, data_file
         "s1": hashlib.sha1("\n".join(s1_df["entity_id"].tolist()).encode()).hexdigest(),
         "top_k": c.get("top_k", 50), "df_max": c.get("df_max", 20000),
         "prefix_weight": c.get("prefix_weight", 0.5),
+        "pruning_version": "v1_sparse_prune",
         "pool": pool_desc,
         "files": [_file_stamp(Path(p)) for p in data_files],
         "generator_src": hashlib.sha1(Path(inspect.getsourcefile(CandidateGenerator)).read_bytes()).hexdigest(),
